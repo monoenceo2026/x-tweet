@@ -1,0 +1,49 @@
+name: Generate Tweets
+
+on:
+  schedule:
+    # 毎日 JST 6:00（UTC 21:00 前日）= その日の3投稿を生成
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate today's tweets
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 任意: モデルを変えたいとき（例: claude-haiku-4-5 で低コスト化）
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          # 任意: 直近ツイートを口調学習に使う（無料枠で読めなければ自動でスキップ）
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+        run: python generate_tweets.py
+
+      - name: Commit generated tweets
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tweets.json queue.json
+          if git diff --staged --quiet; then
+            echo "変更なし（コミットしません）。"
+          else
+            git commit -m "chore: 本日の自動生成ツイートを追加 [skip ci]"
+            git push
+          fi

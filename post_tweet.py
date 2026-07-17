@@ -1,13 +1,24 @@
 """
 株式会社モノエン 中村貴広（@monoenceo2026） 用 X自動投稿スクリプト。
 
-tweets.json に貯めた投稿文プールから、朝/夜の枠に応じて1件を選び投稿する。
-時間帯の判定・順番の割り当てロジックは、GYAKUTEN（中山蒼）アカウント運用の
-daily-tweet 実装を参考にしている。
+1日3回（朝8:00 / 昼12:00 / 夜20:00・JST）に、その時間帯の枠に対応する
+投稿を1件選び、Xへ投稿する。
 
-- 朝枠 / 夜枠は「JSTで14時より前か後か」で判定する
-- 投稿する要素は「運用開始日からの経過日数」から一意に決まるため、
-  状態ファイルを持たなくても同じ日に重複せず、順番に一周する
+投稿の選び方（優先順位）:
+  1. queue.json … その日の朝6:00に Claude が生成した「本日の3投稿」。
+     date が本日（JST）で、該当スロットの本文があればそれを投稿する。
+  2. tweets.json … 生成の予備プール（手書き90件＋過去の生成分の蓄積）。
+     queue が無い / 古い / 該当スロットが空のときのフォールバック。
+     「運用開始日からの経過日数 × 3 ＋ スロット」で決めるため、
+     フォールバック時も同じ日にスロット間で重複しない。
+
+時間帯 → スロットの対応（JST）:
+  ~10:59  → スロット0（朝枠 / 8:00）
+  11:00-15:59 → スロット1（昼枠 / 12:00）
+  16:00~  → スロット2（夜枠 / 20:00）
+
+時間帯判定・順番割り当ての考え方は、GYAKUTEN（中山蒼）アカウント運用の
+daily-tweet 実装を参考にしている。
 """
 
 import json
@@ -20,16 +31,27 @@ import tweepy
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# このリポジトリで自動投稿を開始した日（JST）。ここを基準に何日目かを数える。
+# フォールボール（tweets.json 参照）時の基準日。ここからの経過日数で番号を決める。
 START_DATE = date(2026, 7, 17)
 
-# この時刻より前なら「朝枠」、以降なら「夜枠」。
-MORNING_BEFORE_HOUR = 14
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TWEETS_PATH = os.path.join(BASE_DIR, "tweets.json")
+QUEUE_PATH = os.path.join(BASE_DIR, "queue.json")
 
-TWEETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tweets.json")
+
+def slot_for_hour(hour):
+    """JSTの時刻から投稿スロット（0=朝 / 1=昼 / 2=夜）を求める。"""
+    if hour < 11:
+        return 0
+    if hour < 16:
+        return 1
+    return 2
 
 
-def load_tweets():
+SLOT_NAMES = {0: "朝枠", 1: "昼枠", 2: "夜枠"}
+
+
+def load_pool():
     with open(TWEETS_PATH, encoding="utf-8") as f:
         tweets = json.load(f)
     if not tweets:
@@ -37,14 +59,38 @@ def load_tweets():
     return tweets
 
 
-def pick_tweet(tweets, now_jst):
+def load_queue():
+    """本日分の生成キューを読む。無ければ None。"""
+    if not os.path.exists(QUEUE_PATH):
+        return None
+    try:
+        with open(QUEUE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def pick_from_queue(queue, now_jst, slot):
+    """本日のキューから該当スロットの本文を返す。無ければ None。"""
+    if not queue:
+        return None
+    if queue.get("date") != now_jst.strftime("%Y-%m-%d"):
+        return None
+    tweets = queue.get("tweets") or []
+    if slot < len(tweets):
+        text = (tweets[slot] or "").strip()
+        if text:
+            return text
+    return None
+
+
+def pick_from_pool(pool, now_jst, slot):
+    """予備プールから決定論的に1件選ぶ（フォールバック用）。"""
     day_number = (now_jst.date() - START_DATE).days
     if day_number < 0:
         day_number = 0
-    slot = 0 if now_jst.hour < MORNING_BEFORE_HOUR else 1
-    index = (day_number * 2 + slot) % len(tweets)
-    slot_name = "朝枠" if slot == 0 else "夜枠"
-    return tweets[index], index, slot_name
+    index = (day_number * 3 + slot) % len(pool)
+    return pool[index], index
 
 
 def get_client():
@@ -65,11 +111,23 @@ def get_client():
 
 def main():
     now_jst = datetime.now(JST)
-    tweets = load_tweets()
-    text, index, slot_name = pick_tweet(tweets, now_jst)
+    slot = slot_for_hour(now_jst.hour)
+    slot_name = SLOT_NAMES[slot]
 
-    print(f"[INFO] 現在時刻(JST): {now_jst:%Y-%m-%d %H:%M}／{slot_name}／pool index={index}")
-    print(f"[INFO] 投稿予定の本文:\n{text}")
+    text = pick_from_queue(load_queue(), now_jst, slot)
+    source = "queue.json（本日生成分）"
+    if text is None:
+        pool = load_pool()
+        text, index = pick_from_pool(pool, now_jst, slot)
+        source = f"tweets.json（予備プール index={index}）"
+
+    if len(text) > 280:
+        print(f"[NG] 投稿本文が長すぎます（{len(text)}文字）。中断します。")
+        sys.exit(1)
+
+    print(f"[INFO] 現在時刻(JST): {now_jst:%Y-%m-%d %H:%M}／{slot_name}")
+    print(f"[INFO] 取得元: {source}")
+    print(f"[INFO] 投稿予定の本文（{len(text)}文字）:\n{text}")
 
     client = get_client()
 

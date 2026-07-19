@@ -12,10 +12,15 @@
      「運用開始日からの経過日数 × 3 ＋ スロット」で決めるため、
      フォールバック時も同じ日にスロット間で重複しない。
 
-時間帯 → スロットの対応（JST）:
-  ~10:59  → スロット0（朝枠 / 8:00）
-  11:00-15:59 → スロット1（昼枠 / 12:00）
-  16:00~  → スロット2（夜枠 / 20:00）
+スロットの決め方（優先順位）:
+  1. 明示指定 … 環境変数 TWEET_SLOT（"0"/"1"/"2"）または引数 --slot N。
+     GitHub Actions 側で「どの cron が発火したか」から対応スロットを渡すため、
+     cron が予定時刻より遅れて発火しても、必ず本来の枠が投稿される
+     （＝遅延で朝枠が昼に流れて別枠が出る、といった取り違えが起きない）。
+  2. 実行時刻から判定（フォールバック。手動 auto 実行や TWEET_SLOT 未設定時）:
+       ~10:59      → スロット0（朝枠 / 8:00）
+       11:00-15:59 → スロット1（昼枠 / 12:00）
+       16:00~      → スロット2（夜枠 / 20:00）
 
 時間帯判定・順番割り当ての考え方は、GYAKUTEN（中山蒼）アカウント運用の
 daily-tweet 実装を参考にしている。
@@ -49,6 +54,25 @@ def slot_for_hour(hour):
 
 
 SLOT_NAMES = {0: "朝枠", 1: "昼枠", 2: "夜枠"}
+
+
+def resolve_slot(now_jst):
+    """投稿スロットを決める。明示指定（TWEET_SLOT env / --slot 引数）があればそれを優先し、
+    無ければ実行時刻から判定する。戻り値は (slot, source文字列)。
+
+    明示指定を優先することで、cron が遅延して発火しても本来の枠が確実に投稿される。
+    """
+    override = os.environ.get("TWEET_SLOT", "").strip()
+    for i, arg in enumerate(sys.argv):
+        if arg == "--slot" and i + 1 < len(sys.argv):
+            override = sys.argv[i + 1].strip()
+        elif arg.startswith("--slot="):
+            override = arg.split("=", 1)[1].strip()
+    if override in ("0", "1", "2"):
+        return int(override), "明示指定（TWEET_SLOT/--slot）"
+    if override:
+        print(f"[警告] 不正なスロット指定 '{override}' は無視し、実行時刻から判定します。")
+    return slot_for_hour(now_jst.hour), "実行時刻から判定"
 
 
 def load_pool():
@@ -111,7 +135,7 @@ def get_client():
 
 def main():
     now_jst = datetime.now(JST)
-    slot = slot_for_hour(now_jst.hour)
+    slot, slot_source = resolve_slot(now_jst)
     slot_name = SLOT_NAMES[slot]
 
     text = pick_from_queue(load_queue(), now_jst, slot)
@@ -125,7 +149,7 @@ def main():
         print(f"[NG] 投稿本文が長すぎます（{len(text)}文字）。中断します。")
         sys.exit(1)
 
-    print(f"[INFO] 現在時刻(JST): {now_jst:%Y-%m-%d %H:%M}／{slot_name}")
+    print(f"[INFO] 現在時刻(JST): {now_jst:%Y-%m-%d %H:%M}／{slot_name}（{slot_source}）")
     print(f"[INFO] 取得元: {source}")
     print(f"[INFO] 投稿予定の本文（{len(text)}文字）:\n{text}")
 

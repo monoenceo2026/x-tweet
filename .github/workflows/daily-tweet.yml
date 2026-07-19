@@ -1,14 +1,29 @@
 name: Daily Tweet
 
+# 投稿枠は「どの cron が発火したか」から確定し、TWEET_SLOT で post_tweet.py に渡す。
+# こうすると GitHub のスケジュール遅延で予定時刻より遅く発火しても、必ず本来の枠が投稿される
+# （実行時刻から枠を決めていた旧方式では、遅延時に別の枠が出て本来の枠が飛んでいた）。
+# cron の分は毎時 :00 を避ける（GitHub は正時が最も混雑し、schedule が遅延・スキップしやすい）。
 on:
   schedule:
-    # 毎日 JST 8:00（UTC 23:00 前日）= 朝枠
-    - cron: "0 23 * * *"
-    # 毎日 JST 12:00（UTC 03:00）= 昼枠
-    - cron: "0 3 * * *"
-    # 毎日 JST 20:00（UTC 11:00）= 夜枠
-    - cron: "0 11 * * *"
-  workflow_dispatch: {}
+    # JST 08:08（UTC 前日 23:08）= 朝枠（slot 0）
+    - cron: "8 23 * * *"
+    # JST 12:08（UTC 03:08）= 昼枠（slot 1）
+    - cron: "8 3 * * *"
+    # JST 20:08（UTC 11:08）= 夜枠（slot 2）
+    - cron: "8 11 * * *"
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "投稿枠（auto=実行時刻から判定 / 0=朝 / 1=昼 / 2=夜）"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "0"
+          - "1"
+          - "2"
 
 jobs:
   post:
@@ -25,8 +40,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Determine slot
+        id: slot
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SLOT: ${{ github.event.inputs.slot }}
+        run: |
+          case "$SCHEDULE" in
+            "8 23 * * *") SLOT=0 ;;   # 朝枠
+            "8 3 * * *")  SLOT=1 ;;   # 昼枠
+            "8 11 * * *") SLOT=2 ;;   # 夜枠
+            *)
+              # 手動実行（workflow_dispatch）: auto/未指定なら空＝post_tweet.py が実行時刻から判定
+              if [ "$INPUT_SLOT" = "auto" ] || [ -z "$INPUT_SLOT" ]; then
+                SLOT=""
+              else
+                SLOT="$INPUT_SLOT"
+              fi
+              ;;
+          esac
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "確定スロット: '${SLOT:-（実行時刻から判定）}'（schedule='${SCHEDULE}' input='${INPUT_SLOT}'）"
+
       - name: Post tweet
         env:
+          TWEET_SLOT: ${{ steps.slot.outputs.slot }}
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
